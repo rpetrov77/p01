@@ -166,9 +166,6 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_fout.
         lv_dnum TYPE d020s-dnum.
   DATA: lv_field_value TYPE string.
   DATA: lv_extension TYPE string.
-
-  DATA: lv_class_name TYPE string VALUE 'ZBAS_FILE_COMMON'.
-  DATA: lv_meth_name TYPE string VALUE 'FILE_SELECT_DIALOG'.
   DATA: lv_location TYPE dxfields-location.
   DATA: lv_foper TYPE dxfields-fileoper.
   DATA: lv_filename_tmp TYPE string.
@@ -229,25 +226,7 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_fout.
     WHEN p_act2.
       lv_foper = 'R'.
   ENDCASE.
-  TRY .
-      CLEAR lv_extension.
-      IF lv_location = 'P'. lv_extension = 'TXT'. ENDIF.
-
-      CALL METHOD (lv_class_name)=>(lv_meth_name)
-        EXPORTING
-          iv_default_filename  = lv_field_value
-          iv_location          = lv_location
-          iv_fileoper          = lv_foper
-          iv_default_extension = lv_extension
-        IMPORTING
-          ev_filename_full     = lv_filename_tmp.
-      IF NOT lv_filename_tmp IS INITIAL.
-        p_fout = lv_filename_tmp.
-      ENDIF.
-      RETURN.
-    CATCH cx_root.
-  ENDTRY.
-
+  
   IF lv_field_value IS INITIAL.
     lv_field_value = lv_filename_tmp.
   ENDIF.
