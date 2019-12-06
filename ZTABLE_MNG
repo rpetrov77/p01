@@ -906,9 +906,9 @@ FORM run_in_bgr.
   DATA: lv_jobname TYPE tbtcjob-jobname.
   DATA: lv_jobcount TYPE tbtcjob-jobcount.
   IF lv_upld IS INITIAL.
-    lv_jobname = 'ZBAS_TBL_DOWNL_BGR'.
+    lv_jobname = 'ZTBL_DOWNL_BGR'.
   ELSE.
-    lv_jobname = 'ZBAS_TBL_UPLD_BGR'.
+    lv_jobname = 'ZTBL_UPLD_BGR'.
   ENDIF.
 
   CALL FUNCTION 'JOB_OPEN'
