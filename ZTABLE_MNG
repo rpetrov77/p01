@@ -1,0 +1,1818 @@
+*&---------------------------------------------------------------------*
+*& Report  ZBAS_TABLE_CNT
+*&
+*&---------------------------------------------------------------------*
+*&    Downloads and uploads contents of DDIC tables into/from files.
+*&
+*&    Downloads any sap DB table or view into a file on the PC or into
+*&  a file on the application server. Files are UTF-8 unicode.
+*&  Restriction of selected data via SQL selection criterias.
+*&  Restriction of downloaded data to specified DB column names.
+*&  Possibility for tab delimited download.
+*&  Possibility for download in background into file on the appl server.
+*&    Possibility to upload tab delimited file from SAP server
+*&  into SAP table in foreground or in background.
+*&  File structure and DB table structure must be 1 to 1 and data in
+*&  the file have to be in internal SAP format.
+*&
+*&---------------------------------------------------------------------*
+
+REPORT zbas_table_cnt LINE-SIZE 1023.
+
+TYPE-POOLS: rsds.
+TYPE-POOLS: icon.
+
+DATA: gd_contents TYPE REF TO data.
+DATA: gv_dummy_tcol TYPE fieldname.
+
+DATA: gv_subrc TYPE sy-subrc.
+DATA: gv_correct TYPE flag.
+TYPES: tt_text_table TYPE STANDARD TABLE OF string WITH DEFAULT KEY.
+DATA: gt_text_table TYPE tt_text_table.
+FIELD-SYMBOLS: <gt_tab_items> TYPE INDEX TABLE.
+CONSTANTS: gc_sep_repl TYPE c VALUE '#'.
+TYPES: ty_col_name TYPE string.
+TYPES: tt_col_name TYPE STANDARD TABLE OF ty_col_name WITH DEFAULT KEY.
+DATA: gt_col_name TYPE tt_col_name.
+DATA: gv_cursor TYPE cursor.
+" Column names of data table.
+DATA: gt_hcap TYPE ddfields.
+DATA: gv_file_col_separator TYPE c VALUE cl_abap_char_utilities=>horizontal_tab.
+DATA: gv_row_separator(2) TYPE c VALUE cl_abap_char_utilities=>cr_lf.
+
+CONSTANTS: gc_col_separator(1) TYPE c VALUE ';'.
+
+TYPES: ty_action(1) TYPE c. " U - upload into SAP; D - download from SAP
+TYPES: tt_tabl_col TYPE RANGE OF fieldname.
+TYPES:  BEGIN OF st_cust,
+          tabname         TYPE tabname16,
+          filename        TYPE string,
+          where_clause    TYPE string,
+          tabl_cols       TYPE tt_tabl_col,
+          tab_delimited   TYPE flag,
+          header_col_id   TYPE flag,
+          header_col_name TYPE flag,
+          buffer_size     TYPE i,
+          run_in_bgr      TYPE flag,
+          action          TYPE ty_action,
+          tabl_init       TYPE flag,
+        END OF st_cust.
+DATA: gs_cust TYPE st_cust.
+
+DATA:  functxt            TYPE smp_dyntxt.
+TABLES: sscrfields.
+SELECTION-SCREEN: FUNCTION KEY 1.
+SELECTION-SCREEN: FUNCTION KEY 2.
+
+PARAMETERS: p_action TYPE ty_action NO-DISPLAY.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_tab  FOR FIELD p_tab.
+PARAMETERS: p_tab TYPE tabname16.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_fout FOR FIELD p_fout.
+PARAMETERS: p_fout(250) TYPE c LOWER CASE.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN SKIP 1.
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE c_b1.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(15) c_act1.
+PARAMETERS: p_act1 TYPE c DEFAULT 'X' RADIOBUTTON GROUP act USER-COMMAND on_act1.
+
+SELECTION-SCREEN COMMENT 60(15) c_act2.
+PARAMETERS: p_act2 TYPE c RADIOBUTTON GROUP act.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_tcol1 FOR FIELD so_tcol.
+SELECT-OPTIONS: so_tcol FOR gv_dummy_tcol NO INTERVALS.
+SELECTION-SCREEN END OF LINE.
+
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_tdel FOR FIELD p_tdel.
+PARAMETERS: p_tdel TYPE char1 AS CHECKBOX USER-COMMAND tdel.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_pchi FOR FIELD p_colhi MODIF ID td2.
+PARAMETERS:
+  p_colhi TYPE c AS CHECKBOX MODIF ID td2.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_pcht FOR FIELD p_colht MODIF ID td2.
+PARAMETERS:
+  p_colht TYPE c AS CHECKBOX MODIF ID td2.
+SELECTION-SCREEN END OF LINE.
+
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(50) c_init FOR FIELD p_init MODIF ID up2.
+PARAMETERS: p_init TYPE flag AS CHECKBOX DEFAULT space MODIF ID up2.
+SELECTION-SCREEN END OF LINE.
+
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(30) co_bgr FOR FIELD p_bgr.
+PARAMETERS: p_bgr TYPE char1 AS CHECKBOX USER-COMMAND bgr.
+SELECTION-SCREEN COMMENT 40(30) co_bufs FOR FIELD p_bufs MODIF ID bg2.
+PARAMETERS: p_bufs TYPE i DEFAULT 0 MODIF ID bg2.
+SELECTION-SCREEN END OF LINE.
+
+
+SELECTION-SCREEN END OF BLOCK b1.
+
+* where clause - used in background processing, only
+PARAMETERS: p_where TYPE string NO-DISPLAY.
+
+* flag - if set -> run data download in background
+PARAMETERS: p_bgr_go TYPE char1 DEFAULT '' NO-DISPLAY.
+
+
+
+INITIALIZATION.
+  co_tab  = 'DB Table name'.
+  co_fout = 'File name'.
+  co_bgr  = 'Run in background'.
+  co_bufs = 'Buffer size (background)'.
+  co_tdel = 'Tab delimited file'.
+  co_tcol1 = 'Table columns for download'.
+  co_pchi = 'Header line - Column ID'.
+  co_pcht = 'Header line - Column name'.
+  c_init  = 'Delete the whole table contents before upload'.
+  c_act1 = 'DOWNLOAD'.
+  c_act2 = 'UPLOAD'.
+
+  CLEAR functxt.
+  functxt-icon_text = 'Download file from SAP to PC'.
+  functxt-icon_id   = icon_export.
+  functxt-quickinfo = 'Call transaction for file download'.
+  sscrfields-functxt_01 = functxt.
+  CLEAR functxt.
+  functxt-icon_text = 'Upload file from PC to SAP'.
+  functxt-icon_id   = icon_import.
+  functxt-quickinfo = 'Call transaction for file upload into SAP'.
+  sscrfields-functxt_02 = functxt.
+
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_fout.
+  " Call F4 for file name.
+  DATA: lt_dynpread TYPE STANDARD TABLE OF dynpread,
+        ls_dynpread LIKE LINE OF lt_dynpread.
+  DATA: lv_prog TYPE d020s-prog,
+        lv_dnum TYPE d020s-dnum.
+  DATA: lv_field_value TYPE string.
+  DATA: lv_extension TYPE string.
+
+  DATA: lv_class_name TYPE string VALUE 'ZBAS_FILE_COMMON'.
+  DATA: lv_meth_name TYPE string VALUE 'FILE_SELECT_DIALOG'.
+  DATA: lv_location TYPE dxfields-location.
+  DATA: lv_foper TYPE dxfields-fileoper.
+  DATA: lv_filename_tmp TYPE string.
+
+  " Dynamically read field value of a screen parameter.
+  lv_prog = sy-repid.
+  lv_dnum = sy-dynnr.
+  CLEAR ls_dynpread.
+  ls_dynpread-fieldname = 'P_TAB'.
+  APPEND ls_dynpread TO lt_dynpread.
+  CLEAR lv_field_value.
+  CALL FUNCTION 'DYNP_VALUES_READ'
+    EXPORTING
+      dyname               = lv_prog
+      dynumb               = lv_dnum
+      translate_to_upper   = 'X'
+    TABLES
+      dynpfields           = lt_dynpread[]
+    EXCEPTIONS
+      invalid_abapworkarea = 1
+      invalid_dynprofield  = 2
+      invalid_dynproname   = 3
+      invalid_dynpronummer = 4
+      invalid_request      = 5
+      no_fielddescription  = 6
+      invalid_parameter    = 7
+      undefind_error       = 8
+      double_conversion    = 9
+      stepl_not_found      = 10
+      OTHERS               = 11.
+  IF sy-subrc = 0.
+    READ TABLE lt_dynpread INTO ls_dynpread INDEX 1.
+    IF sy-subrc = 0.
+      lv_field_value = ls_dynpread-fieldvalue.
+      CONDENSE lv_field_value.
+      IF NOT lv_field_value IS INITIAL AND lv_field_value(1) CA '/\'.
+        REPLACE SECTION OFFSET 0 LENGTH 1 OF lv_field_value WITH ''.
+      ENDIF.
+      REPLACE ALL OCCURRENCES OF '/' IN lv_field_value WITH '_' IN CHARACTER MODE.
+      REPLACE ALL OCCURRENCES OF '\' IN lv_field_value WITH '_' IN CHARACTER MODE.
+      REPLACE ALL OCCURRENCES OF ':' IN lv_field_value WITH '_' IN CHARACTER MODE.
+    ENDIF.
+  ENDIF.
+  lv_filename_tmp = lv_field_value.
+
+
+  CLEAR lv_location.
+  IF NOT p_bgr IS INITIAL.
+    lv_location = 'S'.
+    CLEAR lv_field_value.
+  ELSE.
+    lv_location = 'P'.
+  ENDIF.
+
+  CASE 'X'.
+    WHEN p_act1.
+      lv_foper = 'W'.
+    WHEN p_act2.
+      lv_foper = 'R'.
+  ENDCASE.
+  TRY .
+      CLEAR lv_extension.
+      IF lv_location = 'P'. lv_extension = 'TXT'. ENDIF.
+
+      CALL METHOD (lv_class_name)=>(lv_meth_name)
+        EXPORTING
+          iv_default_filename  = lv_field_value
+          iv_location          = lv_location
+          iv_fileoper          = lv_foper
+          iv_default_extension = lv_extension
+        IMPORTING
+          ev_filename_full     = lv_filename_tmp.
+      IF NOT lv_filename_tmp IS INITIAL.
+        p_fout = lv_filename_tmp.
+      ENDIF.
+      RETURN.
+    CATCH cx_root.
+  ENDTRY.
+
+  IF lv_field_value IS INITIAL.
+    lv_field_value = lv_filename_tmp.
+  ENDIF.
+  PERFORM get_single_filename USING lv_field_value CHANGING p_fout.
+
+
+AT SELECTION-SCREEN.
+  CASE sy-ucomm.
+    WHEN 'FC01'.
+      " File download - from sap to pc.
+      CALL TRANSACTION 'CG3Y'.
+    WHEN 'FC02'.
+      " File upload - from PC to sap.
+      CALL TRANSACTION 'CG3Z'.
+    WHEN 'TDEL'.
+      IF p_tdel IS INITIAL.
+        CLEAR: p_colhi, p_colht.
+      ENDIF.
+    WHEN 'BGR'.
+      IF p_bgr IS INITIAL.
+        CLEAR p_bufs.
+      ENDIF.
+    WHEN 'ON_ACT1'.
+      p_tdel = 'X'.
+    WHEN OTHERS.
+  ENDCASE.
+
+AT SELECTION-SCREEN OUTPUT.
+  PERFORM tdel_related_fld_disp USING p_tdel.
+  PERFORM bgr_related_fld_disp USING p_bgr.
+  PERFORM scr_fields_upd.
+
+START-OF-SELECTION.
+  DATA: gv_dummy_text TYPE string.
+
+  PERFORM user_input_check CHANGING gv_subrc.
+  CHECK gv_subrc IS INITIAL.
+
+  IF p_bgr_go IS INITIAL AND
+    NOT sy-batch IS INITIAL.
+    CONCATENATE 'If you want to run this report in background just select "' co_bgr '" and pres F8' INTO
+    gv_dummy_text SEPARATED BY space.
+    CONDENSE gv_dummy_text.
+    WRITE:/ 'Report execuion in background is stopped'.
+    WRITE:/ gv_dummy_text.
+    RETURN.
+  ENDIF.
+
+  IF NOT p_bgr_go IS INITIAL.
+    " Process data download in background.
+    PERFORM cust_fill.
+    PERFORM process_bgr.
+    RETURN.
+  ENDIF.
+
+  IF NOT p_act2 IS INITIAL.
+    PERFORM upld_confirm USING p_tab.
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+* Check input values / reset with correct values.
+  " Buffer size - is correct?
+  IF p_bufs < 0.
+    p_bufs = 0.
+  ENDIF.
+
+  CASE 'X'.
+    WHEN p_act1.
+      p_action = 'D'.
+    WHEN p_act2.
+      p_action = 'U'.
+    WHEN OTHERS.
+      WRITE:/ 'Unknown action'.
+      LEAVE PROGRAM.
+  ENDCASE.
+
+  " Tablename - is a DB table?
+  PERFORM table_check_if_db_tab USING p_tab CHANGING gv_correct.
+  IF gv_correct IS INITIAL.
+    WRITE:/ p_tab, 'is not a dictionary table.'.
+    WRITE:/ 'Process is stopped.'.
+    RETURN.
+  ENDIF.
+
+* Fill in customizing structure.
+  " Get select criterias for DB select, in case of download.
+  IF NOT p_act1 IS INITIAL.
+    PERFORM ui_selc_get USING p_tab CHANGING p_where gv_correct.
+    IF gv_correct IS INITIAL.
+      RETURN.
+    ENDIF.
+  ENDIF.
+
+  PERFORM cust_fill.
+
+
+
+
+* Run the application.
+  IF gs_cust-run_in_bgr IS INITIAL.
+    IF gs_cust-action = 'U'.
+      PERFORM table_upload USING gs_cust-tabname gs_cust-filename.
+      RETURN.
+    ENDIF.
+
+    " Execute data download in foreground.
+    PERFORM parameters_display.
+
+    PERFORM columns_for_download_get   USING gs_cust-tabl_cols CHANGING gt_col_name[].
+    PERFORM columns_for_download_print USING gt_col_name[].
+    PERFORM columns_for_download_check USING gs_cust-tabname gt_col_name[].
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    WRITE:/ 'Creating data structure...'.
+    CLEAR gv_subrc.
+    PERFORM data_struct_create.
+    CHECK gv_subrc IS INITIAL.
+
+    WRITE:/ 'Data downloading...'.
+    IF gs_cust-buffer_size IS INITIAL.
+      PERFORM data_select_no_buffer.
+      IF gs_cust-tab_delimited IS INITIAL.
+        " Export data into file.
+        PERFORM save_to_pc USING gs_cust-filename <gt_tab_items>[].
+      ELSE.
+        " Export converted data into tab delimited file.
+        PERFORM convert_to_col_sep
+          USING
+            gv_file_col_separator
+            gt_col_name[]
+            <gt_tab_items>[]
+          CHANGING
+            gt_text_table[].
+
+        PERFORM column_headings_set
+          USING gs_cust-header_col_id
+                gs_cust-header_col_name
+                gv_file_col_separator
+          CHANGING gt_text_table[].
+
+        PERFORM save_to_pc USING gs_cust-filename gt_text_table[].
+      ENDIF.
+    ELSE.
+    ENDIF.
+  ELSE.
+    " Start job for executing data download in background
+    PERFORM run_in_bgr.
+  ENDIF.
+
+
+* Remove row separators - CR LF if any.
+  DEFINE row_separator_remove.
+    replace all occurrences of gv_row_separator(1)
+    in &1 with space.
+    replace all occurrences of gv_row_separator+1(1)
+    in &1 with space.
+  END-OF-DEFINITION.
+
+*
+FORM data_struct_create.
+  DATA: lo_eref TYPE REF TO cx_root,
+        lv_dummy_text TYPE string.
+  DATA: lv_col_name LIKE LINE OF gt_col_name.
+
+  IF gt_col_name[] IS INITIAL.
+    TRY .
+        CREATE DATA gd_contents TYPE TABLE OF (gs_cust-tabname).
+      CATCH cx_sy_create_data_error INTO lo_eref.
+        lv_dummy_text = lo_eref->get_text( ).
+        WRITE:/ lv_dummy_text.
+        gv_subrc = 4.
+        RETURN.
+    ENDTRY.
+  ELSE.
+
+    DATA : ref_table_des TYPE REF TO cl_abap_structdescr.
+    DATA : idetails TYPE abap_compdescr_tab,
+           xdetails TYPE abap_compdescr,
+           ifc TYPE lvc_t_fcat,
+           ls_ifc LIKE LINE OF ifc.
+    DATA: lv_current_index TYPE i.
+    DATA: lv_index TYPE i.
+
+    ref_table_des ?=
+          cl_abap_typedescr=>describe_by_name( gs_cust-tabname ).
+    idetails[] = ref_table_des->components[].
+
+    LOOP AT idetails INTO xdetails.
+      CLEAR ls_ifc.
+      ls_ifc-fieldname = xdetails-name.
+      ls_ifc-tabname = gs_cust-tabname.
+      CASE xdetails-type_kind.
+        WHEN 'C'.
+          ls_ifc-datatype = 'CHAR'.
+        WHEN 'N'.
+          ls_ifc-datatype = 'NUMC'.
+        WHEN 'D'.
+          ls_ifc-datatype = 'DATE'.
+        WHEN 'P'.
+          ls_ifc-datatype = 'PACK'.
+        WHEN OTHERS.
+          ls_ifc-datatype = xdetails-type_kind.
+      ENDCASE.
+      ls_ifc-inttype = xdetails-type_kind.
+      ls_ifc-intlen = xdetails-length.
+      ls_ifc-decimals = xdetails-decimals.
+      APPEND ls_ifc TO ifc.
+    ENDLOOP.
+
+    LOOP AT ifc INTO ls_ifc.
+      lv_current_index = sy-tabix.
+      READ TABLE gt_col_name WITH KEY table_line = ls_ifc-fieldname TRANSPORTING NO FIELDS.
+      IF sy-subrc <> 0.
+        DELETE ifc INDEX lv_current_index.
+        CONTINUE.
+      ENDIF.
+    ENDLOOP.
+
+    " Sort column names of the data structure.
+    LOOP AT gt_col_name INTO lv_col_name.
+      lv_index = sy-tabix.
+      READ TABLE ifc INTO ls_ifc WITH KEY fieldname = lv_col_name.
+      IF sy-subrc <> 0.
+        WRITE:/ 'Dynamic data structure creation, column with name',
+              lv_col_name, 'can not be found.'.
+        gv_subrc = 4.
+        RETURN.
+      ENDIF.
+      DELETE ifc INDEX sy-tabix.
+      INSERT ls_ifc INTO ifc INDEX lv_index.
+    ENDLOOP.
+
+    CALL METHOD cl_alv_table_create=>create_dynamic_table
+      EXPORTING
+        it_fieldcatalog  = ifc
+        i_length_in_byte = 'X'
+      IMPORTING
+        ep_table         = gd_contents.
+  ENDIF.
+
+
+  ASSIGN gd_contents->* TO <gt_tab_items>.
+  IF sy-subrc <> 0.
+    gv_subrc = sy-subrc.
+    RETURN.
+  ENDIF.
+
+  PERFORM column_names_get USING <gt_tab_items>.
+ENDFORM.                    "data_struct_create
+
+*
+FORM data_select_no_buffer.
+  SELECT (gt_col_name) INTO TABLE <gt_tab_items>
+  FROM (gs_cust-tabname) WHERE (gs_cust-where_clause).
+  WRITE:/ 'Selected records:', sy-dbcnt.
+ENDFORM.                    "data_select
+
+*
+FORM save_to_pc
+  USING
+    iv_file_name TYPE csequence           " file name
+    it_file_contents TYPE STANDARD TABLE. " file contents
+  DATA: lv_filename TYPE string.
+  DATA: lv_filelength TYPE i.
+  DATA: lv_dummy_text TYPE string.
+
+  CONSTANTS: lc_ctab_line_size TYPE i VALUE 500.
+  TYPES: ty_xtab_line(lc_ctab_line_size) TYPE x.
+  DATA: lo_conv TYPE REF TO cl_abap_conv_out_ce.
+  DATA: lv_datac TYPE REF TO data.
+  DATA: lv_tab_lines TYPE i.
+  DATA: lv_file_size TYPE i.
+  DATA: lv_buf_size TYPE i.
+  DATA: lt_xtab TYPE STANDARD TABLE OF ty_xtab_line WITH DEFAULT KEY.
+  DATA: lv_xbuffer TYPE xstring.
+  DATA: lv_xline TYPE ty_xtab_line.
+  FIELD-SYMBOLS: <ls_item> TYPE ANY.
+  FIELD-SYMBOLS: <lv_cline> TYPE c.
+  FIELD-SYMBOLS: <lv_sline> TYPE string.
+  DATA: lv_offset TYPE i,
+        lv_size TYPE i.
+  DATA: lv_temp_size TYPE i.
+  DATA: lv_stop TYPE flag.
+  DATA: lv_ft TYPE c.
+
+  lo_conv = cl_abap_conv_out_ce=>create(
+         encoding = 'UTF-8'
+         endian = 'L' ).
+
+  " Get field type of item.
+  CLEAR lv_ft.
+  READ TABLE it_file_contents ASSIGNING <ls_item> INDEX 1.
+  IF sy-subrc = 0.
+    DESCRIBE FIELD <ls_item> TYPE lv_ft.
+  ENDIF.
+  LOOP AT it_file_contents ASSIGNING <ls_item>.
+    IF lv_ft <> 'g' AND lv_ft <> 'y'.
+      UNASSIGN <lv_cline>.
+      ASSIGN <ls_item> TO <lv_cline> CASTING.
+      row_separator_remove <lv_cline>.
+      lo_conv->convert( EXPORTING data = <lv_cline>
+           IMPORTING buffer = lv_xbuffer ).
+    ELSE.
+      UNASSIGN <lv_sline>.
+      ASSIGN <ls_item> TO <lv_sline>.
+      row_separator_remove <lv_sline>.
+      lo_conv->convert( EXPORTING data = <lv_sline>
+           IMPORTING buffer = lv_xbuffer ).
+    ENDIF.
+
+    CALL METHOD lo_conv->write( lv_xbuffer ).
+
+
+    lo_conv->convert( EXPORTING data = gv_row_separator
+               IMPORTING buffer = lv_xbuffer ).
+    CALL METHOD lo_conv->write( lv_xbuffer ).
+  ENDLOOP.
+
+  lv_xbuffer = lo_conv->get_buffer( ).
+  lv_buf_size = XSTRLEN( lv_xbuffer ).
+  lv_file_size = lv_buf_size.
+  CLEAR lv_stop.
+  CLEAR lv_offset.
+  DO.
+    lv_temp_size = lv_offset + lc_ctab_line_size.
+    IF lv_temp_size < lv_buf_size.
+      lv_size = lc_ctab_line_size.
+    ELSE.
+      lv_size = lv_buf_size - lv_offset.
+      lv_stop = 'X'.
+    ENDIF.
+    lv_xline = lv_xbuffer+lv_offset(lv_size).
+    APPEND lv_xline TO lt_xtab.
+    ADD lv_size TO lv_offset.
+    IF lv_stop = 'X'.
+      EXIT.
+    ENDIF.
+  ENDDO.
+  FREE lv_xbuffer.
+
+  lv_filename = iv_file_name.
+  CALL METHOD cl_gui_frontend_services=>gui_download
+   EXPORTING
+      bin_filesize              = lv_file_size
+      filename                  = lv_filename
+      filetype                  = 'BIN'
+      append                    = space
+      write_field_separator     = space
+*      header                    = '00'
+      trunc_trailing_blanks     = ''
+      write_lf                  = ''
+*      col_select                = SPACE
+*      col_select_mask           = SPACE
+*      dat_mode                  = SPACE
+*      confirm_overwrite         = SPACE
+*      no_auth_check             = SPACE
+*      codepage                  = SPACE
+*      ignore_cerr               = ABAP_TRUE
+*      replacement               = '#'
+*      write_bom                 = SPACE
+       trunc_trailing_blanks_eol = ''
+*      wk1_n_format              = SPACE
+*      wk1_n_size                = SPACE
+*      wk1_t_format              = SPACE
+*      wk1_t_size                = SPACE
+*      show_transfer_status      = 'X'
+*      fieldnames                =
+*      write_lf_after_last_line  = 'X'
+*   IMPORTING
+*     filelength                = lv_filelength
+   CHANGING
+     data_tab                  = lt_xtab[]
+   EXCEPTIONS
+     file_write_error          = 1
+     no_batch                  = 2
+     gui_refuse_filetransfer   = 3
+     invalid_type              = 4
+     no_authority              = 5
+     unknown_error             = 6
+     header_not_allowed        = 7
+     separator_not_allowed     = 8
+     filesize_not_allowed      = 9
+     header_too_long           = 10
+     dp_error_create           = 11
+     dp_error_send             = 12
+     dp_error_write            = 13
+     unknown_dp_error          = 14
+     access_denied             = 15
+     dp_out_of_memory          = 16
+     disk_full                 = 17
+     dp_timeout                = 18
+     file_not_found            = 19
+     dataprovider_exception    = 20
+     control_flush_error       = 21
+     not_supported_by_gui      = 22
+     error_no_gui              = 23
+     OTHERS                    = 24.
+  IF sy-subrc <> 0.
+    IF NOT sy-msgid IS INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO lv_dummy_text.
+      WRITE:/ lv_dummy_text, 'Error:', sy-subrc.
+    ELSE.
+      WRITE:/ 'Error during download of file:', lv_filename.
+      WRITE:/ 'Error:', sy-subrc.
+    ENDIF.
+    sy-subrc = 4.
+    RETURN.
+  ENDIF.
+ENDFORM.                    "save_to_pc2
+
+* Save file on the application server.
+FORM save_to_serv
+  USING
+    value(iv_filename) TYPE csequence " file name
+    it_data TYPE STANDARD TABLE.      " file contents
+  DATA: lv_msg TYPE string.
+  DATA: lv_filename TYPE string.
+  FIELD-SYMBOLS: <ls_file_line> TYPE ANY.
+  DATA: lv_text_line TYPE string.
+
+  lv_filename = iv_filename.
+  OPEN DATASET lv_filename FOR OUTPUT IN TEXT MODE ENCODING UTF-8
+  MESSAGE lv_msg.
+  IF sy-subrc <> 0.
+    gv_subrc = 1.
+    WRITE:/ 'Error - file on the server can not be created:', lv_filename.
+    WRITE:/ lv_msg.
+    RETURN.
+  ENDIF.
+
+  LOOP AT it_data ASSIGNING <ls_file_line>.
+    lv_text_line = <ls_file_line>.
+    row_separator_remove lv_text_line.
+    CATCH SYSTEM-EXCEPTIONS OTHERS = 10.
+      TRANSFER lv_text_line TO lv_filename.
+    ENDCATCH.
+    IF sy-subrc <> 0.
+      gv_subrc = 2.
+      WRITE:/ 'Error during writing to file'.
+      WRITE:/ <ls_file_line>.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+  CLOSE DATASET lv_filename.
+ENDFORM.                    "save_to_Serv
+
+* Ask user to enter additional selection criterias.
+FORM ui_selc_get
+  USING value(iv_tab_name) TYPE csequence  " name of a DB table used for selection
+  CHANGING ev_where_clause TYPE csequence
+           ev_correct TYPE flag.
+
+  DATA: lv_selid TYPE rsdynsel-selid.
+* Definition of the TABLES_TAB table for use in providing the list of
+* fields available for creating select options from
+  DATA: lt_tables TYPE STANDARD TABLE OF rsdstabs.
+
+
+* Definition of Table which includes the select-option range for field
+  TYPES: ty_selopt_t TYPE  rsdsselopt OCCURS 10.
+
+* Definition of field name and select option range table
+  TYPES: BEGIN OF ty_frange,
+           fieldname TYPE rsdstabs-prim_fname,
+           selopt_t TYPE ty_selopt_t,
+         END OF ty_frange.
+
+  TYPES: ty_frange_t TYPE ty_frange OCCURS 10.
+
+  TYPES: BEGIN OF ty_range,
+           tablename LIKE rsdstabs-prim_tab,
+           frange_t TYPE ty_frange_t,
+         END OF ty_range.
+
+  TYPES: ty_range_t TYPE STANDARD TABLE OF ty_range.
+  DATA: it_ranges TYPE ty_range_t.
+
+
+* Definition of the fields list avaiable
+  TYPES: ty_fields TYPE STANDARD TABLE OF rsdsfields.
+  DATA: it_fields TYPE ty_fields.
+
+  DATA: ls_tables LIKE LINE OF lt_tables.
+
+  CLEAR ev_correct.
+  CLEAR ev_where_clause.
+
+  REFRESH lt_tables.
+  CLEAR ls_tables.
+  ls_tables-prim_tab = iv_tab_name.
+  APPEND ls_tables TO lt_tables.
+
+
+
+  CALL FUNCTION 'FREE_SELECTIONS_INIT'
+    EXPORTING
+      kind         = 'T'
+    IMPORTING
+      selection_id = lv_selid
+    TABLES
+      tables_tab   = lt_tables.
+
+  IF sy-subrc <>  0.
+    IF NOT sy-msgid IS INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      MESSAGE 'Error' TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+
+  CALL FUNCTION 'FREE_SELECTIONS_DIALOG'
+    EXPORTING
+      selection_id    = lv_selid
+      title           = 'Select WHERE criteria for Rule'(s12)
+      as_window       = 'X'
+      start_row       = 7
+      start_col       = 10
+    IMPORTING
+      field_ranges    = it_ranges
+    TABLES
+      fields_tab      = it_fields
+    EXCEPTIONS
+      internal_error  = 1
+      no_action       = 2
+      selid_not_found = 3
+      illegal_status  = 4
+      OTHERS          = 5.
+  IF sy-subrc <>  0.
+    IF sy-subrc = 2.
+      WRITE:/ 'User cancellation'.
+      RETURN.
+    ENDIF.
+    IF NOT sy-msgid IS INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+          WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      MESSAGE 'Error' TYPE 'E'.
+    ENDIF.
+  ENDIF.
+
+  DATA: lt_where TYPE rsds_twhere.
+  FIELD-SYMBOLS: <ls_where> LIKE LINE OF lt_where.
+  FIELD-SYMBOLS: <ls_where_line> LIKE LINE OF <ls_where>-where_tab.
+  CALL FUNCTION 'FREE_SELECTIONS_RANGE_2_WHERE'
+    EXPORTING
+      field_ranges  = it_ranges
+    IMPORTING
+      where_clauses = lt_where.
+
+  ev_correct = 'X'.
+  READ TABLE lt_where ASSIGNING <ls_where> INDEX 1.
+  IF sy-subrc = 0.
+    LOOP AT <ls_where>-where_tab ASSIGNING <ls_where_line>.
+      CONCATENATE ev_where_clause <ls_where_line>-line INTO ev_where_clause
+      SEPARATED BY space.
+    ENDLOOP.
+  ENDIF.
+ENDFORM.                    "ui_selc_get
+
+* Check wheter table with name iv_tab_name is a DB table or view.
+* If so -> set the flag value to 'X'.
+FORM table_check_if_db_tab
+  USING
+    value(iv_tab_name) TYPE csequence
+    CHANGING ev_correct TYPE flag.
+
+  DATA: lt_ddtypes TYPE STANDARD TABLE OF ddtypes.
+  DATA: ls_ddtypes LIKE LINE OF lt_ddtypes.
+  DATA: ls_getstate TYPE ddtypeget.
+
+  CLEAR ev_correct.
+
+  CLEAR ls_ddtypes.
+  ls_ddtypes-typename = iv_tab_name.
+  APPEND ls_ddtypes TO lt_ddtypes.
+  CLEAR ls_getstate.
+  CALL FUNCTION 'DD_TYPEINFO_GET'
+    EXPORTING
+      getstate          = ls_getstate
+*     TRACELEVEL        = 0
+*     NEWEST            = ' '
+*     PRID              = 0
+    TABLES
+      ddtypes_tab       = lt_ddtypes[]
+*     DD02L_TAB         =
+*     DD04L_TAB         =
+*     DD40L_TAB         =
+            .
+
+  READ TABLE lt_ddtypes INTO ls_ddtypes INDEX 1.
+  IF sy-subrc = 0 AND ls_ddtypes-typekind = 'S'.
+    ev_correct = 'X'.
+  ENDIF.
+ENDFORM.                    "table_check_if_db_tab
+
+
+* Display dialog for "File Save" and retreive selected full file name.
+FORM get_single_filename
+  USING
+    value(iv_file_name_prop) TYPE csequence " proposal for the file name
+  CHANGING
+    ev_filename TYPE csequence.             " full file name selected by the user
+
+  DATA: lv_def_filename TYPE string.
+  DATA: lv_def_extension TYPE string.
+  DATA: lv_filename TYPE string.
+  DATA: lv_path TYPE string.
+  DATA: lv_fullpath TYPE string.
+  DATA: lv_action_code TYPE i.
+
+  CLEAR ev_filename.
+  lv_def_filename = iv_file_name_prop.
+  lv_def_extension = 'TXT'.
+  CALL METHOD cl_gui_frontend_services=>file_save_dialog
+    EXPORTING
+*      window_title         =
+       default_extension    = lv_def_extension
+       default_file_name    = lv_def_filename
+*      with_encoding        =
+*      file_filter          =
+*      initial_directory    =
+*      prompt_on_overwrite  = 'X'
+    CHANGING
+      filename             = lv_filename
+      path                 = lv_path
+      fullpath             = lv_fullpath
+      user_action          = lv_action_code
+*      file_encoding        =
+    EXCEPTIONS
+      cntl_error           = 1
+      error_no_gui         = 2
+      not_supported_by_gui = 3
+      OTHERS               = 4.
+  CHECK sy-subrc = 0.
+  CHECK lv_action_code = cl_gui_frontend_services=>action_ok.
+  ev_filename = lv_fullpath.
+ENDFORM.                    "get_single_filename
+
+*
+FORM convert_sel_crit
+  CHANGING ev_where TYPE csequence.
+
+  CLEAR ev_where.
+  ev_where = gs_cust-where_clause.
+ENDFORM.                    "convert_sel_crit
+
+* Pass selection criterias for data download to a background job.
+FORM run_in_bgr.
+  DATA: lv_repname TYPE sy-repid.
+  DATA: lv_where TYPE string.
+  DATA: lv_tabname TYPE tabname16.
+  DATA: lv_filename TYPE string.
+  DATA: lv_dummy_text TYPE string.
+  DATA: lv_buffer_size TYPE i.
+  DATA: lv_tdel(1) TYPE c.
+  DATA: lv_upld TYPE flag.
+  DATA: lv_colhi TYPE c,
+        lv_colht TYPE c.
+
+  PERFORM convert_sel_crit CHANGING lv_where.
+  lv_tabname = gs_cust-tabname.
+  lv_filename = gs_cust-filename.
+  lv_tdel = gs_cust-tab_delimited.
+  lv_buffer_size = gs_cust-buffer_size.
+  lv_colhi = gs_cust-header_col_id.
+  lv_colht = gs_cust-header_col_name.
+  lv_upld = ''."p_upld.
+
+  DATA: lv_jobname TYPE tbtcjob-jobname.
+  DATA: lv_jobcount TYPE tbtcjob-jobcount.
+  IF lv_upld IS INITIAL.
+    lv_jobname = 'ZBAS_TBL_DOWNL_BGR'.
+  ELSE.
+    lv_jobname = 'ZBAS_TBL_UPLD_BGR'.
+  ENDIF.
+
+  CALL FUNCTION 'JOB_OPEN'
+    EXPORTING
+*     DELANFREP              = ' '
+*     JOBGROUP               = ' '
+      jobname                = lv_jobname
+*     SDLSTRTDT              = NO_DATE
+*     SDLSTRTTM              = NO_TIME
+*     JOBCLASS               =
+    IMPORTING
+      jobcount               = lv_jobcount
+*   CHANGING
+*     RET                    =
+   EXCEPTIONS
+     cant_create_job        = 1
+     invalid_job_data       = 2
+     jobname_missing        = 3
+     OTHERS                 = 4.
+  IF sy-subrc <> 0.
+    IF NOT sy-msgid IS INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO lv_dummy_text.
+    ELSE.
+      lv_dummy_text = 'Error - background job is not opened.'.
+    ENDIF.
+    WRITE:/ lv_dummy_text.
+    RETURN.
+  ENDIF.
+
+  lv_repname = sy-repid.
+  SUBMIT (lv_repname) USING SELECTION-SCREEN '1000'
+    WITH p_tab     = gs_cust-tabname
+    WITH p_fout    = gs_cust-filename
+    WITH p_where   = gs_cust-where_clause
+    WITH so_tcol   IN gs_cust-tabl_cols
+    WITH p_tdel    = gs_cust-tab_delimited
+    WITH p_bufs    = gs_cust-buffer_size
+    WITH p_colhi   = gs_cust-header_col_id
+    WITH p_colht   = gs_cust-header_col_name
+    WITH p_action  = gs_cust-action
+    WITH p_init    = gs_cust-tabl_init
+    WITH p_bgr_go  = 'X'
+    VIA JOB lv_jobname NUMBER lv_jobcount
+    AND RETURN.
+  IF sy-subrc <> 0.
+    WRITE:/ 'Error -  background job shceduling  has failed:', sy-subrc.
+    RETURN.
+  ENDIF.
+
+  CALL FUNCTION 'JOB_CLOSE'
+    EXPORTING
+      jobcount             = lv_jobcount
+      jobname              = lv_jobname
+      strtimmed            = 'X'
+    EXCEPTIONS
+      cant_start_immediate = 1
+      invalid_startdate    = 2
+      jobname_missing      = 3
+      job_close_failed     = 4
+      job_nosteps          = 5
+      job_notex            = 6
+      lock_failed          = 7
+      invalid_target       = 8
+      OTHERS               = 9.
+  IF sy-subrc <> 0.
+    IF NOT sy-msgid IS INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO lv_dummy_text.
+    ELSE.
+      lv_dummy_text = 'Error - background job executing has failed.'.
+    ENDIF.
+    WRITE:/ lv_dummy_text.
+    RETURN.
+  ENDIF.
+  WRITE:/ 'Background job has been successfully run.'.
+  WRITE:/ 'Job name:', lv_jobname, 'job count:', lv_jobcount.
+ENDFORM.                    "run_in_bgr
+
+* Process data download/upload in background.
+* Duiring download save data into file on appl. server.
+* Duiring upload - upload file from the appl. server into table.
+FORM process_bgr.
+
+  CLEAR gv_subrc.
+
+  WRITE:/ 'Start background process.'.
+  PERFORM parameters_display.
+
+  IF gs_cust-action = 'U'.
+    PERFORM table_upload USING gs_cust-tabname gs_cust-filename.
+    RETURN.
+  ENDIF.
+
+  PERFORM columns_for_download_get USING gs_cust-tabl_cols CHANGING gt_col_name[].
+  PERFORM columns_for_download_print USING gt_col_name[].
+  PERFORM columns_for_download_check USING gs_cust-tabname gt_col_name[].
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  WRITE:/ 'Creating data structure...'.
+  PERFORM data_struct_create.
+  CHECK gv_subrc IS INITIAL.
+
+  WRITE:/ 'Data downloading...'.
+  IF gs_cust-buffer_size IS INITIAL.
+    PERFORM data_select_no_buffer.
+    IF gs_cust-tab_delimited IS INITIAL.
+      " Export data into file.
+      PERFORM save_to_serv USING gs_cust-filename <gt_tab_items>[].
+    ELSE.
+      " Export converted data into tab delimited file.
+      PERFORM convert_to_col_sep
+        USING
+          gv_file_col_separator
+          gt_col_name[]
+          <gt_tab_items>[]
+        CHANGING
+          gt_text_table[].
+
+      PERFORM column_headings_set
+        USING
+          gs_cust-header_col_id
+          gs_cust-header_col_name
+          gv_file_col_separator
+        CHANGING
+          gt_text_table[].
+      PERFORM save_to_serv USING gs_cust-filename gt_text_table[].
+    ENDIF.
+  ELSE.
+    PERFORM process_bgr_buffered_data_save USING gs_cust-filename gs_cust-buffer_size.
+  ENDIF.
+  IF gv_subrc IS INITIAL.
+    WRITE:/ 'Background process has complete successfully.'.
+  ELSE.
+    WRITE:/ 'Background process has complete with error.'.
+  ENDIF.
+ENDFORM.                    "process_bgr
+
+
+*
+FORM process_bgr_buffered_data_save
+  USING
+    value(iv_filename) TYPE csequence " file name
+    value(iv_buffer_size) TYPE i.
+
+  DATA: lv_msg TYPE string.
+  DATA: lv_filename TYPE string.
+  FIELD-SYMBOLS: <ls_file_line> TYPE ANY.
+  DATA: lv_text_line TYPE string.
+  DATA: lv_data_fetched TYPE sy-subrc.
+  DATA: lv_first_time TYPE flag.
+
+  lv_filename = iv_filename.
+  OPEN DATASET lv_filename FOR OUTPUT IN TEXT MODE ENCODING DEFAULT
+  MESSAGE lv_msg.
+  IF sy-subrc <> 0.
+    gv_subrc = 1.
+    WRITE:/ 'Error - file on the server can not be created:', lv_filename.
+    RETURN.
+  ENDIF.
+
+  lv_first_time = 'X'.
+  PERFORM data_select_with_buffer_start.
+  DO.
+    PERFORM data_with_buffer_fetch USING iv_buffer_size CHANGING lv_data_fetched.
+    IF NOT lv_data_fetched IS INITIAL.
+      EXIT.
+    ENDIF.
+
+    IF gs_cust-tab_delimited IS INITIAL.
+      " Export data into file.
+      PERFORM transfer_data_to_serv_file USING iv_filename <gt_tab_items>[].
+    ELSE.
+      " Export converted data into tab delimited file.
+      PERFORM convert_to_col_sep
+        USING
+          gv_file_col_separator
+          gt_col_name[]
+          <gt_tab_items>[]
+        CHANGING
+          gt_text_table[].
+      IF lv_first_time = 'X'.
+        CLEAR lv_first_time.
+        PERFORM column_headings_set
+  USING gs_cust-header_col_id
+        gs_cust-header_col_name
+        gv_file_col_separator
+  CHANGING gt_text_table[].
+      ENDIF.
+      PERFORM transfer_data_to_serv_file USING iv_filename gt_text_table[].
+    ENDIF.
+  ENDDO.
+
+  CLOSE DATASET lv_filename.
+ENDFORM.                    "process_bgr_buffered_data_save
+
+* Convert each line of an input table it_data to a text string, tab delimited.
+* Each component of the input table is converted to a string while keeping
+* internal sap data format.
+FORM convert_to_col_sep
+  USING
+    value(iv_separator) TYPE csequence
+    it_col_name TYPE tt_col_name
+    it_data TYPE STANDARD TABLE
+  CHANGING
+    et_cs_data TYPE STANDARD TABLE.
+
+  FIELD-SYMBOLS: <ls_item> TYPE ANY.
+  FIELD-SYMBOLS: <ls_item_stru> TYPE ANY.
+  FIELD-SYMBOLS: <lv_field_value> TYPE ANY.
+  DATA: lv_text_line TYPE string.
+  DATA: lv_value_set TYPE flag.
+  DATA: lv_field_value TYPE string.
+  DATA: lv_col_name LIKE LINE OF it_col_name.
+
+  REFRESH et_cs_data.
+
+  LOOP AT it_data ASSIGNING <ls_item>.
+    CLEAR lv_text_line.
+    CLEAR lv_value_set.
+    ASSIGN <ls_item> TO <ls_item_stru>.
+    DO.
+      ASSIGN COMPONENT sy-index OF STRUCTURE <ls_item_stru> TO <lv_field_value>.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      lv_field_value = <lv_field_value>.
+      " remove col separators
+      REPLACE ALL OCCURRENCES OF iv_separator IN lv_field_value WITH gc_sep_repl.
+      IF lv_value_set IS INITIAL.
+        lv_text_line = lv_field_value.
+        lv_value_set = 'X'.
+      ELSE.
+        CONCATENATE lv_text_line lv_field_value INTO lv_text_line SEPARATED BY iv_separator.
+        lv_value_set = 'X'.
+      ENDIF.
+    ENDDO.
+    " remove row separators
+    row_separator_remove lv_text_line.
+    APPEND lv_text_line TO et_cs_data.
+  ENDLOOP.
+ENDFORM.                    "convert_to_col_Sep
+
+* Transfer column names from input to output table.
+FORM columns_for_download_get
+  USING
+    it_col_names_raw TYPE tt_tabl_col
+  CHANGING
+    et_col_names TYPE STANDARD TABLE.
+
+  DATA: ls_cname LIKE LINE OF it_col_names_raw.
+
+  REFRESH et_col_names.
+  LOOP AT it_col_names_raw INTO ls_cname.
+    SHIFT ls_cname-low LEFT DELETING LEADING space.
+    IF NOT ls_cname-low IS INITIAL.
+      APPEND ls_cname-low TO et_col_names.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "columns_for_download_get
+
+*
+FORM columns_for_download_print
+  USING
+    et_col_names TYPE STANDARD TABLE.
+  FIELD-SYMBOLS: <ls_col_name> TYPE ANY.
+  WRITE:/ 'Columns from DB table selected for download are:'.
+  LOOP AT et_col_names ASSIGNING <ls_col_name>.
+    WRITE:/ <ls_col_name>.
+  ENDLOOP.
+  IF sy-subrc <> 0.
+    WRITE '*'.
+  ENDIF.
+ENDFORM.                    "columns_for_download_print
+
+* Check wheter column names in table it_col_name exist in the structure of type iv_tab_name.
+* If so -> set sy-subrc = 0 in calling program,
+* else -> set sy-subrc <> 0.
+FORM columns_for_download_check
+  USING
+    iv_tab_name TYPE csequence
+    it_col_name TYPE tt_col_name.
+
+  DATA: lv_stru TYPE REF TO data.
+  DATA: lv_col_name LIKE LINE OF it_col_name.
+  FIELD-SYMBOLS: <ls_stru> TYPE ANY.
+  FIELD-SYMBOLS: <lv_field_val> TYPE ANY.
+  DATA: lv_missing_component TYPE flag.
+
+  IF it_col_name[] IS INITIAL.
+    CLEAR sy-subrc.
+    RETURN.
+  ENDIF.
+
+  CLEAR lv_missing_component.
+  CREATE DATA lv_stru TYPE (iv_tab_name).
+  IF lv_stru IS BOUND.
+    ASSIGN lv_stru->* TO <ls_stru> CASTING TYPE (iv_tab_name).
+    LOOP AT it_col_name INTO lv_col_name.
+      ASSIGN COMPONENT lv_col_name OF STRUCTURE <ls_stru> TO <lv_field_val>.
+      IF sy-subrc <> 0.
+        lv_missing_component = 'X'.
+        WRITE:/ 'Error - Column with name:', lv_col_name, 'does not exist in the table:',
+          iv_tab_name.
+      ENDIF.
+    ENDLOOP.
+  ENDIF.
+
+  IF lv_missing_component IS INITIAL.
+    CLEAR sy-subrc.
+  ELSE.
+    sy-subrc = 4.
+  ENDIF.
+ENDFORM.                    "columns_for_download_check
+
+*
+FORM data_select_with_buffer_start.
+  OPEN CURSOR gv_cursor FOR
+  SELECT (gt_col_name) FROM (gs_cust-tabname) WHERE (gs_cust-where_clause).
+ENDFORM.                    "data_select_with_buffer
+
+*
+FORM data_with_buffer_fetch
+  USING value(iv_buffer_size) TYPE i
+  CHANGING ev_continue TYPE sy-subrc.
+
+  CLEAR ev_continue.
+  REFRESH <gt_tab_items>.
+  FETCH NEXT CURSOR gv_cursor INTO TABLE <gt_tab_items>
+  PACKAGE SIZE iv_buffer_size.
+  ev_continue = sy-subrc.
+ENDFORM.                    "data_with_buffer_fetch
+
+*
+FORM transfer_data_to_serv_file
+  USING
+    iv_file_name TYPE csequence
+    it_data TYPE STANDARD TABLE.
+
+  FIELD-SYMBOLS: <ls_file_line> TYPE ANY.
+  DATA: lv_text_line TYPE string.
+
+  LOOP AT it_data ASSIGNING <ls_file_line>.
+    lv_text_line = <ls_file_line>.
+    CATCH SYSTEM-EXCEPTIONS OTHERS = 10.
+      TRANSFER lv_text_line TO iv_file_name.
+    ENDCATCH.
+    IF sy-subrc <> 0.
+      gv_subrc = 2.
+      WRITE:/ 'Error during writing to file'.
+      WRITE:/ <ls_file_line>.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "transfer_data_to_serv_file
+
+* Use rtti to retreive column names which are used in the internal
+* table for data selection.
+* Fill in result in table: gt_hcap.
+FORM column_names_get
+  USING it_data TYPE STANDARD TABLE.
+
+
+  DATA: lo_rtti_strdesc TYPE REF TO cl_abap_structdescr.
+  DATA : lo_rtti_tabdesc TYPE REF TO cl_abap_tabledescr.
+  DATA : lt_component TYPE abap_compdescr_tab,
+         ls_component LIKE LINE OF lt_component.
+  DATA: lt_ddicf TYPE ddfields,
+        ls_ddicf LIKE LINE OF lt_ddicf.
+
+  REFRESH gt_hcap.
+
+  lo_rtti_tabdesc ?= cl_abap_typedescr=>describe_by_data( it_data ).
+  lo_rtti_strdesc ?= lo_rtti_tabdesc->get_table_line_type( ).
+
+  CALL METHOD lo_rtti_strdesc->get_ddic_field_list
+    EXPORTING
+      p_langu                  = sy-langu
+      p_including_substructres = abap_false
+    RECEIVING
+      p_field_list             = lt_ddicf[]
+    EXCEPTIONS
+      not_found                = 1
+      no_ddic_type             = 2
+      OTHERS                   = 3.
+  IF sy-subrc = 0.
+    gt_hcap[] = lt_ddicf[].
+  ELSE.
+    lt_component[] = lo_rtti_strdesc->components[].
+    LOOP AT lt_component INTO ls_component.
+      CLEAR ls_ddicf.
+      ls_ddicf-fieldname = ls_component-name.
+      APPEND ls_ddicf TO gt_hcap.
+    ENDLOOP.
+  ENDIF.
+
+ENDFORM.                    "column_names_get
+
+* Insert lines into table ct_data which contain column headings.
+FORM column_headings_set
+  USING
+    value(iv_col_heading_fldid) TYPE flag
+    value(iv_col_heading_fldtext) TYPE flag
+    value(p_separator) TYPE csequence
+  CHANGING
+    ct_data TYPE tt_text_table.
+
+  DATA: lv_tab_line LIKE LINE OF ct_data.
+  DATA: lv_first_time TYPE flag.
+  DATA: lv_index_insert TYPE i.
+  FIELD-SYMBOLS: <ls_hcap> LIKE LINE OF gt_hcap.
+
+  lv_index_insert = 1.
+  " Column heading - field name
+  IF NOT iv_col_heading_fldid IS INITIAL.
+    CLEAR lv_tab_line.
+    lv_first_time = 'X'.
+    LOOP AT gt_hcap ASSIGNING <ls_hcap>.
+      IF lv_first_time = 'X'.
+        CLEAR lv_first_time.
+        lv_tab_line = <ls_hcap>-fieldname.
+        CONTINUE.
+      ENDIF.
+      CONCATENATE lv_tab_line <ls_hcap>-fieldname INTO lv_tab_line
+      SEPARATED BY p_separator.
+    ENDLOOP.
+    INSERT lv_tab_line INTO ct_data INDEX lv_index_insert.
+    ADD 1 TO lv_index_insert.
+  ENDIF.
+
+  " Column heading - field text
+  IF NOT iv_col_heading_fldtext IS INITIAL.
+    CLEAR lv_tab_line.
+    lv_first_time = 'X'.
+    LOOP AT gt_hcap ASSIGNING <ls_hcap>.
+      IF lv_first_time = 'X'.
+        CLEAR lv_first_time.
+        lv_tab_line = <ls_hcap>-scrtext_m.
+        CONTINUE.
+      ENDIF.
+      CONCATENATE lv_tab_line <ls_hcap>-scrtext_m INTO lv_tab_line
+      SEPARATED BY p_separator.
+    ENDLOOP.
+    INSERT lv_tab_line INTO ct_data INDEX lv_index_insert.
+    ADD 1 TO lv_index_insert.
+  ENDIF.
+ENDFORM.                    "column_headings_set
+
+*
+FORM parameters_display.
+  WRITE:/ 'Run at:', sy-datum, sy-uzeit.
+  WRITE:/ 'User:', sy-uname.
+  WRITE:/ 'Action:'.
+  CASE gs_cust-action.
+    WHEN 'U'.
+      WRITE: 'Data upload into SAP'.
+    WHEN 'D'.
+      WRITE: 'Data download from SAP'.
+    WHEN OTHERS.
+  ENDCASE.
+  WRITE:/ 'Table name:', p_tab.
+  WRITE:/ 'File name:', gs_cust-filename.
+  WRITE:/ 'Tab delimited file:', gs_cust-tab_delimited.
+  WRITE:/ 'Run in background:', gs_cust-run_in_bgr.
+  WRITE:/ 'Buffer size:', gs_cust-buffer_size.
+  WRITE:/ 'Header column ID:', gs_cust-header_col_id.
+  WRITE:/ 'Header column name:', gs_cust-header_col_name.
+  WRITE:/ 'Delete table contents before upload:', gs_cust-tabl_init.
+  WRITE:/ 'Selection criterias:', gs_cust-where_clause.
+ENDFORM.                    "parameters_display
+
+*
+FORM tdel_related_fld_disp
+  USING
+    value(iv_show) TYPE flag.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = 'TD2'.
+      IF iv_show IS INITIAL.
+        screen-input = '0'.
+        screen-active = '0'.
+      ELSE.
+        screen-input = '1'.
+        screen-active = '1'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "tdel_related_fld_disp
+
+
+
+*
+FORM bgr_related_fld_disp
+  USING
+    value(iv_show) TYPE flag.
+
+  LOOP AT SCREEN.
+    IF screen-group1 = 'BG2'.
+      IF iv_show IS INITIAL.
+        screen-input = '0'.
+        screen-active = '0'.
+      ELSE.
+        screen-input = '1'.
+        screen-active = '1'.
+      ENDIF.
+      MODIFY SCREEN.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.                    "bgr_related_fld_disp
+
+*
+FORM table_upload
+  USING iv_tabname
+        iv_filename.
+
+  DATA: lv_message TYPE string.
+  DATA: lv_line TYPE string.
+  DATA: lt_cval TYPE STANDARD TABLE OF string.
+  DATA: lv_separtor TYPE string.
+  FIELD-SYMBOLS: <lv_cval> TYPE ANY.
+  DATA: lo_db_struc TYPE REF TO data.
+  DATA: lo_db_buffer TYPE REF TO data.
+  DATA: lv_comp_current TYPE i.
+  DATA: lv_row TYPE i.
+  DATA: lv_row_to_delete TYPE i.
+  FIELD-SYMBOLS: <ls_db_struc> TYPE ANY.
+  FIELD-SYMBOLS: <lv_sfield> TYPE ANY.
+  FIELD-SYMBOLS: <lt_buffer> TYPE ANY TABLE.
+  DATA: lv_skip_last_column_once TYPE flag.
+
+
+  WRITE:/ 'Start data upload into SAP table:', iv_tabname.
+
+  IF iv_tabname IS INITIAL.
+    WRITE:/ 'Table name is missing'.
+    RETURN.
+  ENDIF.
+  IF iv_filename IS INITIAL.
+    WRITE:/ 'File name is missing'.
+    RETURN.
+  ENDIF.
+
+  WRITE:/ 'Table name:', iv_tabname.
+  WRITE:/ 'Server file name:', iv_filename.
+
+  OPEN DATASET iv_filename FOR INPUT IN TEXT MODE ENCODING UTF-8 MESSAGE lv_message.
+  IF sy-subrc = 0.
+    WRITE:/ 'File is opened:', iv_filename.
+    WRITE:/ 'as UTF-8'.
+  ELSE.
+    WRITE:/ 'Error while opening file:', iv_filename.
+    WRITE:/ lv_message.
+    RETURN.
+  ENDIF.
+
+  CREATE DATA lo_db_struc TYPE (iv_tabname).
+  IF sy-subrc <> 0.
+    WRITE:/ 'Creating DB structure has failed:', iv_tabname.
+    RETURN.
+  ENDIF.
+  ASSIGN lo_db_struc->* TO <ls_db_struc>.
+  IF NOT <ls_db_struc> IS ASSIGNED.
+    WRITE:/ 'Creating DB structure has failed:', iv_tabname.
+    RETURN.
+  ENDIF.
+
+  CREATE DATA lo_db_buffer TYPE STANDARD TABLE OF (iv_tabname).
+  IF sy-subrc <> 0.
+    WRITE:/ 'Creating DB buffer has failed:', iv_tabname.
+    RETURN.
+  ENDIF.
+  ASSIGN lo_db_buffer->* TO <lt_buffer>.
+  IF NOT <lt_buffer> IS ASSIGNED.
+    WRITE:/ 'Creating DB buffer has failed:', iv_tabname.
+    RETURN.
+  ENDIF.
+
+  " Remove rows with column ID or column text.
+  CLEAR lv_row_to_delete.
+  IF NOT gs_cust-header_col_id IS INITIAL.
+    ADD 1 TO lv_row_to_delete.
+  ENDIF.
+  IF NOT gs_cust-header_col_name IS INITIAL.
+    ADD 1 TO lv_row_to_delete.
+  ENDIF.
+
+  lv_separtor = gv_file_col_separator.
+  CLEAR lv_row.
+  REFRESH <lt_buffer>.
+  DO.
+    ADD 1 TO lv_row.
+    CLEAR lv_line.
+    REFRESH lt_cval.
+    READ DATASET iv_filename INTO lv_line.
+    IF sy-subrc <> 0.
+      EXIT.
+    ENDIF.
+
+    IF lv_row <= lv_row_to_delete.
+      CONTINUE.
+    ENDIF.
+
+    row_separator_remove lv_line.
+
+    SPLIT lv_line AT lv_separtor INTO TABLE lt_cval.
+    CLEAR lv_comp_current.
+    CLEAR <ls_db_struc>.
+    CLEAR lv_skip_last_column_once.
+    DO.
+      ADD 1 TO lv_comp_current.
+      ASSIGN COMPONENT lv_comp_current OF STRUCTURE <ls_db_struc> TO <lv_sfield>.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      UNASSIGN <lv_cval>.
+      READ TABLE lt_cval ASSIGNING <lv_cval> INDEX lv_comp_current.
+      IF sy-subrc <> 0.
+        IF lv_skip_last_column_once IS INITIAL.
+          lv_skip_last_column_once = 'X'.
+        ELSE.
+          WRITE:/ 'Error in row:', lv_row, 'db structure does not match file structure.'.
+          WRITE:/ lv_line.
+          RETURN.
+        ENDIF.
+        CONTINUE.
+      ENDIF.
+      <lv_sfield> = <lv_cval>.
+    ENDDO.
+    INSERT <ls_db_struc> INTO TABLE <lt_buffer>.
+  ENDDO.
+
+  IF <lt_buffer>[] IS INITIAL.
+    WRITE:/ 'No data is supplied from the file, DB change is stopped'.
+    RETURN.
+  ENDIF.
+
+  IF NOT gs_cust-tabl_init IS INITIAL.
+    DELETE FROM (iv_tabname).
+    INSERT (iv_tabname) FROM TABLE <lt_buffer>.
+  ELSE.
+    MODIFY (iv_tabname) FROM TABLE <lt_buffer>.
+  ENDIF.
+
+  IF sy-subrc <> 0.
+    WRITE:/ 'Error during inserting DB entries'.
+    ROLLBACK WORK.
+    RETURN.
+  ENDIF.
+  COMMIT WORK.
+  FORMAT COLOR COL_POSITIVE.
+  WRITE:/ 'DB update has completed', 'entries inserted:', sy-dbcnt.
+  FORMAT COLOR COL_BACKGROUND.
+ENDFORM.                    "table_upload
+
+* Ask user to confirm.
+* If confirmed -> sy-subrc = 0 in calling program.
+* In background process -> set sy-subrc = 0.
+FORM gui_user_yesno_dialog
+  USING
+    iv_txt_message TYPE csequence
+    iv_txt_title TYPE csequence.
+
+  DATA: lv_title TYPE string.
+  DATA: lv_text TYPE string.
+  DATA: lv_answer TYPE c.
+
+  CLEAR sy-subrc.
+  CHECK sy-batch IS INITIAL.
+
+  lv_text  = iv_txt_message.
+  lv_title = iv_txt_title.
+
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING
+     titlebar                    = lv_title
+*     DIAGNOSE_OBJECT             = ' '
+      text_question               = lv_text
+      text_button_1               = 'Yes'(t01)
+*     ICON_BUTTON_1               = ' '
+      text_button_2               = 'No'(t02)
+*     ICON_BUTTON_2               = ' '
+      default_button              = '2'
+      display_cancel_button       = ''
+*     USERDEFINED_F1_HELP         = ' '
+*     START_COLUMN                = 25
+*     START_ROW                   = 6
+*     POPUP_TYPE                  =
+*     IV_QUICKINFO_BUTTON_1       = ' '
+*     IV_QUICKINFO_BUTTON_2       = ' '
+   IMPORTING
+     answer                      = lv_answer
+*   TABLES
+*     PARAMETER                   =
+   EXCEPTIONS
+     text_not_found              = 1
+     OTHERS                      = 2.
+  IF sy-subrc <> 0 OR lv_answer <> '1'.
+    " do not agree
+    sy-subrc = 4.
+  ELSE.
+    " agree
+    CLEAR sy-subrc.
+  ENDIF.
+ENDFORM.                    "gui_user_yesno_dialog
+
+*
+FORM upld_confirm USING iv_tabname.
+
+  DATA: lv_umsg TYPE string.
+
+  CONCATENATE 'This program is going to upload data into table' iv_tabname
+              'from a file.'  INTO lv_umsg SEPARATED BY space.
+  IF NOT p_init IS INITIAL.
+    CONCATENATE lv_umsg 'The whole table contents will be DELETED before starting data upload.'
+    INTO lv_umsg SEPARATED BY space.
+  ENDIF.
+  CONCATENATE lv_umsg  'Changes can not be undone. Do you want to continue ?' INTO lv_umsg SEPARATED BY space.
+  PERFORM gui_user_yesno_dialog
+     USING lv_umsg ''.
+  IF sy-subrc <> 0.
+    WRITE:/ 'User cancellation'.
+    sy-subrc = 4.
+    RETURN.
+  ENDIF.
+
+  lv_umsg = 'Are you shure ?'.
+  PERFORM gui_user_yesno_dialog
+     USING lv_umsg ''.
+  IF sy-subrc <> 0.
+    WRITE:/ 'User cancellation'.
+    sy-subrc = 4.
+    RETURN.
+  ENDIF.
+  CLEAR sy-subrc.
+ENDFORM.                    "upld_confirm
+
+
+* Upload file form PC to the server in UTF-8 format.
+* File is read in ASC format, each file line as a separate row.
+* If correct -> ev_result is initial.
+FORM load_file_gui
+  USING iv_filename
+  CHANGING et_data TYPE STANDARD TABLE
+           ev_result TYPE sy-subrc.
+
+  DATA: lt_data            TYPE STANDARD TABLE OF string WITH DEFAULT KEY.
+  DATA: lv_dummy_text      TYPE string.
+  DATA: lv_length_input    TYPE i.
+  DATA: lv_filename_source TYPE string.
+
+  ev_result = 1.
+  REFRESH et_data.
+
+  lv_filename_source = iv_filename.
+  CALL METHOD cl_gui_frontend_services=>gui_upload
+    EXPORTING
+      filename                = lv_filename_source
+      filetype                = 'ASC'
+      has_field_separator     = ''
+*      header_length           = 0
+      read_by_line            = 'X'
+*      dat_mode                = SPACE
+      codepage                = 'UTF-8'
+*      ignore_cerr             = ABAP_TRUE
+*      replacement             = '#'
+*      virus_scan_profile      =
+*    IMPORTING
+*      filelength              = lv_length_input
+*      header                  =
+    CHANGING
+      data_tab                = lt_data[]
+    EXCEPTIONS
+      file_open_error         = 1
+      file_read_error         = 2
+      no_batch                = 3
+      gui_refuse_filetransfer = 4
+      invalid_type            = 5
+      no_authority            = 6
+      unknown_error           = 7
+      bad_data_format         = 8
+      header_not_allowed      = 9
+      separator_not_allowed   = 10
+      header_too_long         = 11
+      unknown_dp_error        = 12
+      access_denied           = 13
+      dp_out_of_memory        = 14
+      disk_full               = 15
+      dp_timeout              = 16
+      not_supported_by_gui    = 17
+      error_no_gui            = 18
+      OTHERS                  = 19.
+  IF sy-subrc <> 0.
+    ev_result = sy-subrc.
+    WRITE:/ 'File open error:', ev_result, 'file:', lv_filename_source.
+    CLEAR lv_dummy_text.
+    IF NOT sy-msgid IS INITIAL.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+        WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4 INTO lv_dummy_text.
+      WRITE:/ lv_dummy_text.
+    ENDIF.
+    RETURN.
+  ENDIF.
+  et_data = lt_data[].
+  ev_result = 0.
+ENDFORM.                    "load_file_gui
+
+*
+FORM cust_fill.
+  CLEAR gs_cust.
+  gs_cust-tabname         = p_tab.
+  gs_cust-filename        = p_fout.
+  gs_cust-tabl_cols       = so_tcol[].
+  gs_cust-tab_delimited   = p_tdel.
+  gs_cust-header_col_id   = p_colhi.
+  gs_cust-header_col_name = p_colht.
+  gs_cust-run_in_bgr      = p_bgr.
+  gs_cust-buffer_size     = p_bufs.
+  gs_cust-where_clause    = p_where.
+  gs_cust-action          = p_action.
+  gs_cust-tabl_init       = p_init.
+ENDFORM.                    "cust_fill
+
+*
+FORM scr_fields_upd.
+
+  LOOP AT SCREEN.
+    CASE 'X'.
+      WHEN p_act1.  " Download
+        " Show
+        IF screen-name CP '*SO_TCOL*' OR
+           screen-name = 'CO_TCOL1'.
+          screen-input = '1'.
+          screen-active = '1'.
+        ENDIF.
+        " Hide
+        IF screen-name = 'P_INIT' OR
+           screen-name = 'C_INIT'.
+          screen-input = '0'.
+          screen-active = '0'.
+        ENDIF.
+
+        " Enable edit
+        IF screen-name = 'P_TDEL'.
+          screen-input = '1'.
+        ENDIF.
+      WHEN p_act2.  " Upload
+        " Show
+        IF screen-name = 'P_INIT' OR
+           screen-name = 'C_INIT'.
+          screen-input = '1'.
+          screen-active = '1'.
+        ENDIF.
+        " Hide
+        IF screen-name CP '*SO_TCOL*' OR
+           screen-name = 'CO_TCOL1'.
+          screen-input = '0'.
+          screen-active = '0'.
+        ENDIF.
+
+        " Disable edit.
+        IF screen-name = 'P_TDEL'.
+          screen-input = '0'.
+        ENDIF.
+    ENDCASE.
+    MODIFY SCREEN.
+  ENDLOOP.
+ENDFORM.                    "scr_fields_upd
+
+*
+FORM user_input_check CHANGING ev_subrc TYPE sy-subrc.
+  CLEAR ev_subrc.
+
+  IF p_tab IS INITIAL.
+    WRITE:/ 'Please enter a table name'.
+    ev_subrc = 4.
+  ENDIF.
+
+  IF p_fout IS INITIAL.
+    WRITE:/ 'Please enter a file name'.
+    ev_subrc = 4.
+  ENDIF.
+
+ENDFORM.                    "user_input_check
