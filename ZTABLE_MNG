@@ -1,5 +1,5 @@
 *&---------------------------------------------------------------------*
-*& Report  ZBAS_TABLE_CNT
+*& Report  ztable_mng
 *&
 *&---------------------------------------------------------------------*
 *&    Downloads and uploads contents of DDIC tables into/from files.
@@ -17,7 +17,7 @@
 *&
 *&---------------------------------------------------------------------*
 
-REPORT zbas_table_cnt LINE-SIZE 1023.
+REPORT ztable_mng LINE-SIZE 1023.
 
 TYPE-POOLS: rsds.
 TYPE-POOLS: icon.
